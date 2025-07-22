@@ -1,25 +1,22 @@
 pipeline {
+    agent any
+    tools {
+        maven "MAVEN3.9" 
+    }
     
-	agent any
-/*	
-	tools {
-        maven "maven3"
-	
-    }
-*/	
     environment {
-        NEXUS_VERSION = "nexus3"
-        NEXUS_PROTOCOL = "http"
-        NEXUS_URL = "172.31.40.209:8081"
-        NEXUS_REPOSITORY = "vprofile-release"
-	NEXUS_REPO_ID    = "vprofile-release"
-        NEXUS_CREDENTIAL_ID = "nexuslogin"
-        ARTVERSION = "${env.BUILD_ID}"
+        DOCKER_REGISTRY = "abdallahhamed" // e.g., "docker.io" or your private registry URL
+        DOCKER_CREDENTIAL_ID = "docker-hub-credentials" // Jenkins credentials ID for Docker registry
+        DOCKER_IMAGE_NAME = "vprofile-app"
+        DOCKER_IMAGE_TAG = "${env.BUILD_ID}"
+        KUBECONFIG = "/root/.kube/config" // Path to kubeconfig file in Jenkins
+        K8S_NAMESPACE = "vprofile-namespace"
+        APP_NAME = "vprofile-app"
+        APP_PORT = 8080 // Your application port
     }
-	
-    stages{
-        
-        stage('BUILD'){
+    
+    stages {
+        stage('BUILD') {
             steps {
                 sh 'mvn clean install -DskipTests'
             }
@@ -31,19 +28,19 @@ pipeline {
             }
         }
 
-	stage('UNIT TEST'){
+        stage('UNIT TEST') {
             steps {
                 sh 'mvn test'
             }
         }
 
-	stage('INTEGRATION TEST'){
+        stage('INTEGRATION TEST') {
             steps {
                 sh 'mvn verify -DskipUnitTests'
             }
         }
-		
-        stage ('CODE ANALYSIS WITH CHECKSTYLE'){
+        
+        stage('CODE ANALYSIS WITH CHECKSTYLE') {
             steps {
                 sh 'mvn checkstyle:checkstyle'
             }
@@ -53,70 +50,103 @@ pipeline {
                 }
             }
         }
-
-        stage('CODE ANALYSIS with SONARQUBE') {
-          
-		  environment {
-             scannerHome = tool 'sonarscanner4'
-          }
-
-          steps {
-            withSonarQubeEnv('sonar-pro') {
-               sh '''${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=vprofile \
-                   -Dsonar.projectName=vprofile-repo \
-                   -Dsonar.projectVersion=1.0 \
-                   -Dsonar.sources=src/ \
-                   -Dsonar.java.binaries=target/test-classes/com/visualpathit/account/controllerTest/ \
-                   -Dsonar.junit.reportsPath=target/surefire-reports/ \
-                   -Dsonar.jacoco.reportsPath=target/jacoco.exec \
-                   -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml'''
-            }
-
-            timeout(time: 10, unit: 'MINUTES') {
-               waitForQualityGate abortPipeline: true
-            }
-          }
-        }
-
-        stage("Publish to Nexus Repository Manager") {
+        
+        stage('Build and Push Docker Image') {
             steps {
                 script {
-                    pom = readMavenPom file: "pom.xml";
-                    filesByGlob = findFiles(glob: "target/*.${pom.packaging}");
-                    echo "${filesByGlob[0].name} ${filesByGlob[0].path} ${filesByGlob[0].directory} ${filesByGlob[0].length} ${filesByGlob[0].lastModified}"
-                    artifactPath = filesByGlob[0].path;
-                    artifactExists = fileExists artifactPath;
-                    if(artifactExists) {
-                        echo "*** File: ${artifactPath}, group: ${pom.groupId}, packaging: ${pom.packaging}, version ${pom.version} ARTVERSION";
-                        nexusArtifactUploader(
-                            nexusVersion: NEXUS_VERSION,
-                            protocol: NEXUS_PROTOCOL,
-                            nexusUrl: NEXUS_URL,
-                            groupId: pom.groupId,
-                            version: ARTVERSION,
-                            repository: NEXUS_REPOSITORY,
-                            credentialsId: NEXUS_CREDENTIAL_ID,
-                            artifacts: [
-                                [artifactId: pom.artifactId,
-                                classifier: '',
-                                file: artifactPath,
-                                type: pom.packaging],
-                                [artifactId: pom.artifactId,
-                                classifier: '',
-                                file: "pom.xml",
-                                type: "pom"]
-                            ]
-                        );
-                    } 
-		    else {
-                        error "*** File: ${artifactPath}, could not be found";
+                    // Build Docker image
+                    docker.build("${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}", "--build-arg WAR_FILE=target/*.war .")
+                    
+                    // Authenticate with Docker registry
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", DOCKER_CREDENTIAL_ID) {
+                        // Push Docker image
+                        docker.image("${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}").push()
+                        
+                        // Optionally push as latest
+                        docker.image("${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}").push('latest')
                     }
                 }
             }
         }
-
-
+        
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    // Check if deployment already exists
+                    def deploymentExists = sh(
+                        script: "kubectl get deployment ${APP_NAME} -n ${K8S_NAMESPACE} --ignore-not-found",
+                        returnStatus: true
+                    ) == 0
+                    
+                    if (!deploymentExists) {
+                        // Create namespace if it doesn't exist
+                        sh "kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -"
+                        
+                        // Create deployment
+                        sh """
+                            cat <<EOF | kubectl apply -f -
+                            apiVersion: apps/v1
+                            kind: Deployment
+                            metadata:
+                              name: ${APP_NAME}
+                              namespace: ${K8S_NAMESPACE}
+                              labels:
+                                app: ${APP_NAME}
+                            spec:
+                              replicas: 2
+                              selector:
+                                matchLabels:
+                                  app: ${APP_NAME}
+                              template:
+                                metadata:
+                                  labels:
+                                    app: ${APP_NAME}
+                                spec:
+                                  containers:
+                                  - name: ${APP_NAME}
+                                    image: ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}
+                                    ports:
+                                    - containerPort: ${APP_PORT}
+                                    resources:
+                                      requests:
+                                        cpu: "100m"
+                                        memory: "256Mi"
+                                      limits:
+                                        cpu: "500m"
+                                        memory: "512Mi"
+                            EOF
+                        """
+                        
+                        // Create service
+                        sh """
+                            cat <<EOF | kubectl apply -f -
+                            apiVersion: v1
+                            kind: Service
+                            metadata:
+                              name: ${APP_NAME}-svc
+                              namespace: ${K8S_NAMESPACE}
+                              labels:
+                                app: ${APP_NAME}
+                            spec:
+                              type: NodePort
+                              selector:
+                                app: ${APP_NAME}
+                              ports:
+                              - protocol: TCP
+                                port: 80
+                                targetPort: ${APP_PORT}
+                            EOF
+                        """
+                        
+                        // Wait for deployment to be ready
+                        sh "kubectl rollout status deployment/${APP_NAME} -n ${K8S_NAMESPACE} --timeout=300s"
+                    } else {
+                        echo "Deployment already exists. Use a different pipeline for updates."
+                        // Alternatively, you could update the existing deployment here
+                        // sh "kubectl set image deployment/${APP_NAME} ${APP_NAME}=${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} -n ${K8S_NAMESPACE}"
+                    }
+                }
+            }
+        }
     }
-
-
 }
