@@ -1,0 +1,101 @@
+pipeline {
+    agent any
+    environment {
+        DOCKER_REGISTRY = "abdallahhamed"
+        DOCKER_IMAGE_NAME = "vprofile-app"
+        K8S_NAMESPACE = "vprofile-prod"
+        APP_NAME = "vprofile-app"
+        APP_PORT = 8080
+        NODE_PORT = 31000
+    }
+    
+    parameters {
+        string(name: 'IMAGE_TAG', 
+               description: 'Docker image tag to deploy', 
+               defaultValue: 'latest')
+    }
+    
+    stages {
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                        sh """
+                            export KUBECONFIG=${KUBECONFIG}
+                            
+                            # Create namespace if not exists
+                            kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                            
+                            # Apply deployment with proper EOF termination
+                            kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APP_NAME}
+  namespace: ${K8S_NAMESPACE}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+    spec:
+      containers:
+      - name: ${APP_NAME}
+        image: ${DOCKER_REGISTRY}/${DOCKER_IMAGE_NAME}:${params.IMAGE_TAG}
+        ports:
+        - containerPort: ${APP_PORT}
+EOF
+                            
+                            # Apply service with proper EOF termination
+                            kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${APP_NAME}-svc
+  namespace: ${K8S_NAMESPACE}
+spec:
+  type: NodePort
+  selector:
+    app: ${APP_NAME}
+  ports:
+  - port: 80
+    targetPort: ${APP_PORT}
+    nodePort: ${NODE_PORT}
+EOF
+                            
+                            # Verify deployment
+                            kubectl rollout status deployment/${APP_NAME} -n ${K8S_NAMESPACE} --timeout=300s
+                        """
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+            script {
+                currentBuild.description = "Deployed ${params.IMAGE_TAG}"
+            }
+        }
+        success {
+            script {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    def nodeIP = sh(
+                        script: "export KUBECONFIG=${KUBECONFIG} && kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}'",
+                        returnStdout: true
+                    ).trim()
+                    echo "Deployment successful! Access URL: http://${nodeIP}:${NODE_PORT}"
+                }
+            }
+        }
+        failure {
+            echo "Deployment failed! Check logs for details."
+        }
+    }
+}
